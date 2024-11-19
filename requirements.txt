@@ -4,5 +4,4 @@ folium==0.15.1
 streamlit-folium==0.18.0
 plotly==5.18.0
 numpy==1.26.3
-geopy==2.4.1
 python-dateutil==2.8.2
