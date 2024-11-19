@@ -3,11 +3,8 @@ import pandas as pd
 import folium
 from streamlit_folium import folium_static
 import plotly.express as px
-from datetime import datetime
 import numpy as np
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
-import time
+from datetime import datetime
 
 # Configure Streamlit page
 st.set_page_config(
@@ -17,116 +14,145 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize session state for coordinates cache
-if 'suburb_coordinates' not in st.session_state:
-    st.session_state.suburb_coordinates = {}
-
-@st.cache_data
-def geocode_suburb(suburb, state="South Australia", country="Australia"):
-    """Geocode a suburb name using Nominatim with caching."""
-    if suburb in st.session_state.suburb_coordinates:
-        return st.session_state.suburb_coordinates[suburb]
-    
-    geolocator = Nominatim(user_agent="sa_crime_stats_dashboard")
-    try:
-        query = f"{suburb}, {state}, {country}"
-        location = geolocator.geocode(query)
-        time.sleep(1)  # Respect Nominatim's usage policy
-        
-        if location:
-            coords = (location.latitude, location.longitude)
-            st.session_state.suburb_coordinates[suburb] = coords
-            return coords
-    except (GeocoderTimedOut, GeocoderUnavailable):
-        pass
-    return None
+# Pre-defined coordinates for major South Australian suburbs
+SUBURB_COORDINATES = {
+    "ADELAIDE": (-34.9285, 138.6007),
+    "NORTH ADELAIDE": (-34.9066, 138.5944),
+    "WEST ADELAIDE": (-34.9285, 138.5607),
+    "PORT ADELAIDE": (-34.8474, 138.5079),
+    "GLENELG": (-34.9820, 138.5160),
+    "MODBURY": (-34.8329, 138.6834),
+    "ELIZABETH": (-34.7117, 138.6696),
+    "SALISBURY": (-34.7583, 138.6417),
+    "MARION": (-35.0159, 138.5562),
+    "MORPHETT VALE": (-35.1271, 138.5237),
+    "GOLDEN GROVE": (-34.7889, 138.7258),
+    "MOUNT BARKER": (-35.0667, 138.8560),
+    "VICTOR HARBOR": (-35.5524, 138.6174),
+    "MURRAY BRIDGE": (-35.1197, 139.2750),
+    "PORT PIRIE": (-33.1858, 138.0173),
+    "WHYALLA": (-33.0379, 137.5753),
+    "PORT AUGUSTA": (-32.4936, 137.7743),
+    "PORT LINCOLN": (-34.7217, 135.8559),
+    "MOUNT GAMBIER": (-37.8283, 140.7828),
+    "NOARLUNGA": (-35.1397, 138.4973)
+}
 
 @st.cache_data
 def load_and_process_data(uploaded_file):
-    """Load and process the uploaded CSV file."""
+    """Load and process the uploaded CSV file with optimization for large datasets."""
     try:
-        df = pd.read_csv(uploaded_file)
+        # Read CSV in chunks for large files
+        chunks = []
+        for chunk in pd.read_csv(uploaded_file, chunksize=50000):
+            chunks.append(chunk)
+        df = pd.concat(chunks)
         
         # Convert date column
         df['Reported Date'] = pd.to_datetime(df['Reported Date'], format='%d/%m/%Y')
         
-        # Ensure required columns exist
-        required_columns = [
-            'Reported Date', 'Suburb - Incident', 'Offence Level 1 Description',
-            'Offence Level 2 Description', 'Offence Level 3 Description', 'Offence count'
-        ]
+        # Aggregate data for faster processing
+        df['Month'] = df['Reported Date'].dt.to_period('M')
+        monthly_data = df.groupby(['Month', 'Suburb - Incident', 
+                                 'Offence Level 1 Description',
+                                 'Offence Level 2 Description'])['Offence count'].sum().reset_index()
         
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            st.error(f"Missing required columns: {', '.join(missing_columns)}")
-            return None
-            
-        return df
+        return df, monthly_data
     except Exception as e:
         st.error(f"Error processing file: {str(e)}")
-        return None
+        return None, None
 
 def create_map(df):
-    """Create a folium map with crime incidents."""
-    # Center the map on Adelaide
+    """Create a folium map with crime incidents using pre-cached coordinates."""
     m = folium.Map(location=[-34.9285, 138.6007], zoom_start=10)
+    
+    # Create a feature group for better performance
+    marker_cluster = folium.FeatureGroup(name="Crime Incidents")
     
     # Group by suburb and count incidents
     suburb_counts = df.groupby('Suburb - Incident')['Offence count'].sum()
     
-    # Add markers for each suburb
+    # Add markers only for suburbs with known coordinates
+    mapped_suburbs = 0
+    total_suburbs = len(suburb_counts)
+    
     for suburb, count in suburb_counts.items():
-        coords = geocode_suburb(suburb)
-        if coords:
+        if suburb in SUBURB_COORDINATES:
+            mapped_suburbs += 1
+            coords = SUBURB_COORDINATES[suburb]
             folium.CircleMarker(
                 location=coords,
                 radius=np.log(count + 1) * 5,
-                popup=f"{suburb}<br>Total incidents: {count}",
+                popup=f"{suburb}<br>Total incidents: {count:,}",
                 color='red',
                 fill=True,
                 fill_color='red',
                 fill_opacity=0.6
-            ).add_to(m)
+            ).add_to(marker_cluster)
+    
+    marker_cluster.add_to(m)
+    
+    # Display mapping coverage
+    st.caption(f"Mapped {mapped_suburbs} out of {total_suburbs} suburbs. Some suburbs may not be shown due to missing coordinates.")
     
     return m
 
-def create_time_series(df):
-    """Create time series analysis of crime incidents."""
-    daily_crimes = df.groupby('Reported Date')['Offence count'].sum().reset_index()
+@st.cache_data
+def create_time_series(_df, monthly_data):
+    """Create time series analysis using aggregated monthly data."""
+    monthly_crimes = monthly_data.groupby('Month')['Offence count'].sum().reset_index()
+    monthly_crimes['Month'] = monthly_crimes['Month'].astype(str)
     
-    fig = px.line(daily_crimes, 
-                  x='Reported Date', 
+    fig = px.line(monthly_crimes,
+                  x='Month',
                   y='Offence count',
-                  title='Daily Crime Incidents Over Time')
+                  title='Monthly Crime Incidents',
+                  template='plotly_white')
     fig.update_layout(
-        xaxis_title="Date",
+        xaxis_title="Month",
         yaxis_title="Number of Incidents",
-        showlegend=False
+        showlegend=False,
+        hovermode='x unified'
     )
     return fig
 
-def create_crime_type_breakdown(df):
-    """Create breakdown of crime types."""
-    crime_types = df.groupby('Offence Level 2 Description')['Offence count'].sum()
+@st.cache_data
+def create_crime_type_breakdown(monthly_data):
+    """Create breakdown of crime types using aggregated data."""
+    crime_types = monthly_data.groupby('Offence Level 2 Description')['Offence count'].sum()
     crime_types = crime_types.sort_values(ascending=True)
     
     fig = px.bar(crime_types,
                  orientation='h',
                  title='Crime Types Distribution',
-                 labels={'value': 'Number of Incidents', 
+                 template='plotly_white',
+                 labels={'value': 'Number of Incidents',
                         'index': 'Crime Type'})
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title="Number of Incidents",
+        yaxis_title="Crime Type",
+        height=600
+    )
     return fig
 
-def create_suburb_analysis(df):
-    """Create analysis of crime by suburb."""
+@st.cache_data
+def create_top_suburbs(df):
+    """Create analysis of top suburbs by crime count."""
     suburb_crimes = df.groupby('Suburb - Incident')['Offence count'].sum()
-    suburb_crimes = suburb_crimes.sort_values(ascending=True).tail(10)
+    top_suburbs = suburb_crimes.nlargest(10).sort_values(ascending=True)
     
-    fig = px.bar(suburb_crimes,
+    fig = px.bar(top_suburbs,
                  orientation='h',
                  title='Top 10 Suburbs by Crime Incidents',
-                 labels={'value': 'Number of Incidents', 
+                 template='plotly_white',
+                 labels={'value': 'Number of Incidents',
                         'index': 'Suburb'})
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title="Number of Incidents",
+        yaxis_title="Suburb"
+    )
     return fig
 
 def main():
@@ -135,91 +161,49 @@ def main():
     st.sidebar.header("About")
     st.sidebar.info(
         "This dashboard visualizes crime statistics in South Australia. "
-        "Upload a CSV file with crime data to begin analysis."
+        "Upload a CSV file containing crime data to begin analysis."
     )
     
-    st.sidebar.header("Instructions")
-    st.sidebar.markdown(
-        """
-        1. Upload your crime statistics CSV file
-        2. View the map of crime incidents
-        3. Analyze trends over time
-        4. Explore crime patterns
-        
-        Required CSV columns:
-        - Reported Date (DD/MM/YYYY)
-        - Suburb - Incident
-        - Offence Level 1 Description
-        - Offence Level 2 Description
-        - Offence Level 3 Description
-        - Offence count
-        """
-    )
-    
-    # File upload
-    uploaded_file = st.file_uploader(
-        "Upload your crime statistics CSV file",
-        type="csv",
-        help="Upload a CSV file containing crime statistics data"
-    )
+    uploaded_file = st.file_uploader("Upload your crime statistics CSV file", type="csv")
     
     if uploaded_file is not None:
-        # Load and process data
-        df = load_and_process_data(uploaded_file)
-        
-        if df is not None:
-            # Create tabs for different views
-            tab1, tab2, tab3 = st.tabs(["📍 Map View", "📈 Time Analysis", "🔍 Crime Patterns"])
+        with st.spinner('Processing data... This may take a moment.'):
+            df, monthly_data = load_and_process_data(uploaded_file)
+            
+        if df is not None and monthly_data is not None:
+            # Display basic statistics in the sidebar
+            st.sidebar.header("Summary Statistics")
+            total_incidents = df['Offence count'].sum()
+            unique_suburbs = df['Suburb - Incident'].nunique()
+            date_range = f"{df['Reported Date'].min().strftime('%d/%m/%Y')} - {df['Reported Date'].max().strftime('%d/%m/%Y')}"
+            
+            st.sidebar.metric("Total Incidents", f"{total_incidents:,}")
+            st.sidebar.metric("Unique Suburbs", unique_suburbs)
+            st.sidebar.metric("Date Range", date_range)
+            
+            # Create tabs
+            tab1, tab2, tab3 = st.tabs(["📍 Map", "📈 Trends", "🔍 Analysis"])
             
             with tab1:
-                st.header("Geographic Distribution of Crime")
-                with st.spinner("Loading map... This may take a few moments."):
-                    m = create_map(df)
-                    folium_static(m, width=1000, height=600)
+                st.subheader("Geographic Distribution of Crime")
+                m = create_map(df)
+                folium_static(m, width=1000, height=600)
             
             with tab2:
-                st.header("Temporal Analysis")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Time series plot
-                    time_series_fig = create_time_series(df)
-                    st.plotly_chart(time_series_fig, use_container_width=True)
-                
-                with col2:
-                    # Day of week analysis
-                    df['Day of Week'] = df['Reported Date'].dt.day_name()
-                    dow_crimes = df.groupby('Day of Week')['Offence count'].sum()
-                    dow_fig = px.bar(dow_crimes, 
-                                   title='Crimes by Day of Week',
-                                   labels={'value': 'Number of Incidents', 
-                                          'index': 'Day of Week'})
-                    st.plotly_chart(dow_fig, use_container_width=True)
+                st.subheader("Crime Trends Over Time")
+                time_series_fig = create_time_series(df, monthly_data)
+                st.plotly_chart(time_series_fig, use_container_width=True)
             
             with tab3:
-                st.header("Crime Patterns Analysis")
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    # Crime types breakdown
-                    crime_types_fig = create_crime_type_breakdown(df)
+                    crime_types_fig = create_crime_type_breakdown(monthly_data)
                     st.plotly_chart(crime_types_fig, use_container_width=True)
                 
                 with col2:
-                    # Suburb analysis
-                    suburb_fig = create_suburb_analysis(df)
-                    st.plotly_chart(suburb_fig, use_container_width=True)
-                
-                # Summary statistics
-                st.subheader("Summary Statistics")
-                total_incidents = df['Offence count'].sum()
-                unique_suburbs = df['Suburb - Incident'].nunique()
-                most_common_crime = df.groupby('Offence Level 2 Description')['Offence count'].sum().idxmax()
-                
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total Incidents", f"{total_incidents:,}")
-                col2.metric("Unique Suburbs", unique_suburbs)
-                col3.metric("Most Common Crime Type", most_common_crime)
+                    top_suburbs_fig = create_top_suburbs(df)
+                    st.plotly_chart(top_suburbs_fig, use_container_width=True)
 
 if __name__ == "__main__":
     main()
